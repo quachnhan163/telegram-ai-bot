@@ -1,0 +1,162 @@
+import logging
+import os
+import uuid
+import zipfile
+import cv2
+import numpy as np
+from PIL import Image
+from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from transformers import CLIPProcessor, CLIPModel
+import torch
+from openai import OpenAI
+import pytesseract
+
+# --- Khởi tạo ---
+logging.basicConfig(level=logging.INFO)
+BOT_TOKEN = "7831028962:AAHOVdU0cQLIedm0BWRCNBhWGD30erNpuRo"
+EMBEDDING_DIR = "embeddings"
+IMAGE_DIR = "library"
+os.makedirs(EMBEDDING_DIR, exist_ok=True)
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def get_embedding(image_path):
+    image = Image.open(image_path).convert("RGB")
+    inputs = processor(images=image, return_tensors="pt").to(device)
+    with torch.no_grad():
+        embedding = model.get_image_features(**inputs)
+    return embedding[0].cpu().numpy()
+
+def draw_rectangle(image_path, box, color=(0, 255, 0)):
+    img = cv2.imread(image_path)
+    x, y, w, h = box
+    cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+    output_path = image_path.replace(".jpg", "_boxed.jpg")
+    cv2.imwrite(output_path, img)
+    return output_path
+
+def extract_red_rect(image_path):
+    img = cv2.imread(image_path)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lower_red1 = np.array([0, 70, 50])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 70, 50])
+    upper_red2 = np.array([180, 255, 255])
+    mask = cv2.inRange(hsv, lower_red1, upper_red1) | cv2.inRange(hsv, lower_red2, upper_red2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        x, y, w, h = cv2.boundingRect(contours[0])
+        return x, y, w, h
+    return None
+
+def crop_image(image_path, box):
+    image = Image.open(image_path)
+    return image.crop((box[0], box[1], box[0] + box[2], box[1] + box[3]))
+
+# --- Xử lý Bot ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton("📂 Lưu ảnh", callback_data="save_mode"),
+                 InlineKeyboardButton("🔎 Tìm ảnh", callback_data="search_mode")],
+                [InlineKeyboardButton("🧠 GPT Chat", callback_data="chat_mode")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Chào bạn! Chọn chức năng:", reply_markup=reply_markup)
+
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['mode'] = query.data
+    await query.edit_message_text(f"Chế độ hiện tại: {query.data}")
+
+async def save_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    img_id = str(uuid.uuid4())
+    img_path = os.path.join(IMAGE_DIR, f"{img_id}.jpg")
+    await file.download_to_drive(img_path)
+    emb = get_embedding(img_path)
+    np.save(os.path.join(EMBEDDING_DIR, f"{img_id}.npy"), emb)
+    await update.message.reply_text("✅ Đã lưu ảnh vào thư viện.")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.user_data.get('mode', 'search_mode')
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    tmp_path = f"tmp_{uuid.uuid4()}.jpg"
+    await file.download_to_drive(tmp_path)
+
+    if mode == "save_mode":
+        await save_image(update, context)
+        return
+
+    box = extract_red_rect(tmp_path)
+    if not box:
+        await update.message.reply_text("❗ Không phát hiện vùng khoanh đỏ.")
+        return
+
+    cropped = crop_image(tmp_path, box)
+    cropped_path = tmp_path.replace(".jpg", "_crop.jpg")
+    cropped.save(cropped_path)
+    query_emb = get_embedding(cropped_path)
+
+    best_score = -1
+    best_id = None
+    for emb_file in os.listdir(EMBEDDING_DIR):
+        lib_emb = np.load(os.path.join(EMBEDDING_DIR, emb_file))
+        score = np.dot(query_emb, lib_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(lib_emb))
+        if score > best_score:
+            best_score = score
+            best_id = emb_file.replace(".npy", "")
+
+    if best_id:
+        best_img = os.path.join(IMAGE_DIR, f"{best_id}.jpg")
+        boxed_path = draw_rectangle(best_img, box, color=(255, 0, 255))
+        await update.message.reply_photo(photo=InputFile(boxed_path), caption=f"🔍 Giống nhất (điểm tương đồng: {best_score:.2f})")
+    else:
+        await update.message.reply_text("🚫 Không tìm được ảnh giống.")
+
+    os.remove(tmp_path)
+    os.remove(cropped_path)
+
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.message.text
+    response = openai_client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": query}]
+    )
+    await update.message.reply_text(response.choices[0].message.content)
+
+async def download_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    zip_name = "library.zip"
+    with zipfile.ZipFile(zip_name, 'w') as z:
+        for filename in os.listdir(IMAGE_DIR):
+            z.write(os.path.join(IMAGE_DIR, filename), arcname=filename)
+    await update.message.reply_document(InputFile(zip_name))
+    os.remove(zip_name)
+
+async def extract_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    tmp_path = f"ocr_{uuid.uuid4()}.jpg"
+    await file.download_to_drive(tmp_path)
+    text = pytesseract.image_to_string(Image.open(tmp_path))
+    await update.message.reply_text(f"📝 Văn bản nhận diện:
+{text.strip()}")
+    os.remove(tmp_path)
+
+# --- Khởi chạy bot ---
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("save", save_image))
+app.add_handler(CommandHandler("download", download_library))
+app.add_handler(CommandHandler("ocr", extract_text))
+app.add_handler(CallbackQueryHandler(button))
+app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+app.run_polling()

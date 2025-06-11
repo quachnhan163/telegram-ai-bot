@@ -1,0 +1,8 @@
+python-telegram-bot==20.3
+transformers
+torch
+opencv-python
+Pillow
+python-dotenv
+openai
+easyocr
